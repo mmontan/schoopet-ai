@@ -161,3 +161,96 @@ def test_confirmation_request_serializes_for_firestore():
     assert data["function_call_id"] == "confirm-1"
     assert data["tool_name"] == "send_email"
     assert data["tool_args"] == {"to": "x"}
+
+
+def _interactive_credential_event(fc_id: str = "cred-1", auth_uri: str = "https://accounts.google.com/o/oauth2/v2/auth?x=1"):
+    """Build an event carrying an interactive (authUri) adk_request_credential call."""
+    return Event(
+        author="agent",
+        content=types.Content(
+            role="model",
+            parts=[
+                types.Part(
+                    function_call=types.FunctionCall(
+                        name="adk_request_credential",
+                        id=fc_id,
+                        args={
+                            "functionCallId": fc_id,
+                            "authConfig": {
+                                "authScheme": {"type": "gcpAuthProviderScheme"},
+                                "exchangedAuthCredential": {
+                                    "authType": "oauth2",
+                                    "oauth2": {
+                                        "authUri": auth_uri,
+                                        "nonce": "d372753b-6e62-4f31-bc2d-6a86b92d8258",
+                                    },
+                                },
+                                "credentialKey": "adk_gcpAuthProviderScheme_abc_",
+                            },
+                        },
+                    )
+                )
+            ],
+        ),
+    )
+
+
+def test_strip_auth_uri_removes_auth_uri_from_oauth2():
+    auth_config = {
+        "authScheme": {"type": "gcpAuthProviderScheme"},
+        "exchangedAuthCredential": {
+            "authType": "oauth2",
+            "oauth2": {"authUri": "https://x", "auth_uri": "https://x", "nonce": "n"},
+        },
+        "credentialKey": "k",
+    }
+
+    stripped = AgentEngineClient._strip_auth_uri(auth_config)
+
+    assert "authUri" not in stripped["exchangedAuthCredential"]["oauth2"]
+    assert "auth_uri" not in stripped["exchangedAuthCredential"]["oauth2"]
+    assert stripped["exchangedAuthCredential"]["oauth2"]["nonce"] == "n"
+    # original left untouched
+    assert auth_config["exchangedAuthCredential"]["oauth2"]["authUri"] == "https://x"
+
+
+@pytest.mark.asyncio
+async def test_resolve_iam_credential_settles_without_prompting_when_credential_valid():
+    """First-call uri_consent_required that clears on the settle retry must not prompt."""
+    client = AgentEngineClient.__new__(AgentEngineClient)
+    # The settle retry returns a turn with no credential request → credential is valid.
+    client.send_credential_response = AsyncMock(return_value=[])
+
+    events, req = await client.resolve_iam_credential_events(
+        user_id="592762352374644736",
+        session_id="s1",
+        events=[_interactive_credential_event()],
+        context="async_task",
+    )
+
+    assert req is None
+    client.send_credential_response.assert_awaited_once()
+    # The credential response echoed back must NOT contain the authUri.
+    sent_config = client.send_credential_response.await_args.kwargs["auth_config_dict"]
+    assert "authUri" not in sent_config["exchangedAuthCredential"]["oauth2"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_iam_credential_prompts_when_still_interactive_after_settle():
+    """A genuinely missing credential keeps returning authUri → prompt after settle cap."""
+    client = AgentEngineClient.__new__(AgentEngineClient)
+    # Every settle retry still comes back interactive → genuine re-auth needed.
+    client.send_credential_response = AsyncMock(
+        return_value=[_interactive_credential_event()]
+    )
+
+    events, req = await client.resolve_iam_credential_events(
+        user_id="592762352374644736",
+        session_id="s1",
+        events=[_interactive_credential_event()],
+        context="async_task",
+    )
+
+    assert req is not None
+    assert req.auth_uri.startswith("https://accounts.google.com")
+    assert client.send_credential_response.await_count == AgentEngineClient._SETTLE_CAP
