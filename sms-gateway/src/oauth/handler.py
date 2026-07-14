@@ -1,5 +1,6 @@
 """OAuth HTTP handler — IAM connector callback only."""
 import asyncio
+import copy
 import html
 import logging
 from urllib.parse import unquote
@@ -44,13 +45,26 @@ async def _resume_agent_after_consent(
         f"fc_id={credential_fc_id!r} credentialKey={credential_key!r}"
     )
     await asyncio.sleep(_CREDENTIAL_PROPAGATION_DELAY_SECONDS)
+
+    # Strip authUri before responding so ADK treats this as "consent complete" rather
+    # than "still waiting for auth". Sending back the original authUri causes ADK to
+    # keep the session in uri_consent_required state, making every workspace tool call
+    # return empty even though credentials:finalize already stored the token.
+    auth_config_complete = copy.deepcopy(auth_config_dict) if auth_config_dict else {}
+    exchanged = auth_config_complete.get("exchangedAuthCredential") or {}
+    oauth2 = dict(exchanged.get("oauth2") or {})
+    oauth2.pop("authUri", None)
+    oauth2.pop("auth_uri", None)
+    if exchanged or oauth2:
+        auth_config_complete.setdefault("exchangedAuthCredential", {})["oauth2"] = oauth2
+
     logger.info(f"[oauth] resume_after_consent: sending credential response for user={uid}")
     try:
         events = await _agent_client.send_credential_response(
             user_id=user_id,
             session_id=session_id,
             credential_function_call_id=credential_fc_id,
-            auth_config_dict=auth_config_dict,
+            auth_config_dict=auth_config_complete,
         )
         logger.info(
             f"[oauth] resume_after_consent: credential response sent, "
@@ -62,6 +76,26 @@ async def _resume_agent_after_consent(
             exc_info=True,
         )
         return
+
+    # Resolve any auto-credential requests the resumed session emitted so that
+    # workspace tools can actually fetch the stored token from the IAM connector.
+    try:
+        events, remaining_cred_req = await _agent_client.resolve_iam_credential_events(
+            user_id=user_id,
+            session_id=session_id,
+            events=events,
+            context="resume_after_consent",
+        )
+        if remaining_cred_req:
+            logger.warning(
+                f"[oauth] resume_after_consent: credential still interactive after resume "
+                f"for user={uid} — nonce={remaining_cred_req.nonce[:8] if remaining_cred_req.nonce else 'n/a'}..."
+            )
+    except Exception as e:
+        logger.warning(
+            f"[oauth] resume_after_consent: resolve_iam_credential_events failed for user={uid}: {e}",
+            exc_info=True,
+        )
 
     logger.info(f"[oauth] resume_after_consent: clearing pending credential for user={uid}")
     await _session_manager.clear_pending_credential(user_id)
