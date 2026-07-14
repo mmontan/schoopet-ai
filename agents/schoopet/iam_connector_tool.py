@@ -65,12 +65,15 @@ async def check_connector_credential(tool_context=None, target_user_id: str = ""
         user_id, connector_name, GOOGLE_PERSONAL_SCOPES, continue_uri,
     )
 
+    # NOTE: force_refresh was removed from the v1alpha IAM connector API. Sending it
+    # (True or False) causes a 400 "Unknown name forceRefresh: Cannot find field".
+    # The main ADK retrieve path is already patched in gcp_auth.py to omit it; this
+    # diagnostic tool must do the same or every retrieve_credentials call 400s.
     request = RetrieveCredentialsRequest(
         connector=connector_name,
         user_id=user_id,
         scopes=GOOGLE_PERSONAL_SCOPES,
         continue_uri=continue_uri,
-        force_refresh=True,
     )
 
     client = _make_client()
